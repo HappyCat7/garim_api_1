@@ -1,26 +1,10 @@
+
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import '../models/detection_result.dart';
-import 'package:flutter/services.dart' show rootBundle;
-enum BlurEffect { gaussian, mosaic, sticker }
 
 class BlurService {
-  img.Image? decodedSticker;
-
-  Future<void> loadSticker() async {
-    try {
-      final data = await rootBundle.load('assets/sticker.png');
-      final bytes = data.buffer.asUint8List();
-      if (bytes.isNotEmpty) {
-        decodedSticker = img.decodeImage(bytes);
-        debugPrint('스티커 로드 성공');
-      }
-    } catch (e) {
-      debugPrint('스티커 로드 실패: $e');
-    }
-  }
-
   Future<Uint8List> applyBlur(
       File imageFile,
       List<DetectionResult> detections,
@@ -40,8 +24,7 @@ class BlurService {
       final left = box.left.clamp(0, originalImage.width - 1).toInt();
       final top = box.top.clamp(0, originalImage.height - 1).toInt();
       final right = box.right.clamp(0, originalImage.width.toDouble()).toInt();
-      final bottom =
-      box.bottom.clamp(0, originalImage.height.toDouble()).toInt();
+      final bottom = box.bottom.clamp(0, originalImage.height.toDouble()).toInt();
 
       if (right <= left || bottom <= top) continue;
 
@@ -50,72 +33,100 @@ class BlurService {
       final cropWidth = right - left;
       final cropHeight = bottom - top;
 
-      final croppedArea = img.copyCrop(
-        result,
-        x: left,
-        y: top,
-        width: cropWidth,
-        height: cropHeight,
-      );
+      switch (effect) {
+        case BlurEffect.blackBar:
+        // 영역을 완전한 검은색 사각형으로 채우기
+          img.fillRect(
+            result,
+            x1: left,
+            y1: top,
+            x2: right,
+            y2: bottom,
+            color: img.ColorRgb8(0, 0, 0),
+          );
+          break;
 
-      if (effect == BlurEffect.sticker && decodedSticker != null) {
-        // 스티커 효과
-        final stickerRatio = decodedSticker!.width / decodedSticker!.height;
-        final targetRatio = cropWidth / cropHeight;
+        case BlurEffect.frostedGlass:
+        // Step 1: 영역만 크롭 후 가우시안 블러
+          final crop = img.copyCrop(
+            result,
+            x: left,
+            y: top,
+            width: cropWidth,
+            height: cropHeight,
+          );
+          final blurred = img.gaussianBlur(
+            crop,
+            radius: blurIntensity.toInt().clamp(2, 15),
+          );
+          img.compositeImage(
+            result,
+            blurred,
+            dstX: left,
+            dstY: top,
+          );
 
-        int finalW, finalH;
-        if (targetRatio > stickerRatio) {
-          finalH = cropHeight;
-          finalW = (cropHeight * stickerRatio).toInt();
-        } else {
-          finalW = cropWidth;
-          finalH = (cropWidth / stickerRatio).toInt();
-        }
+          // Step 2: 반투명 흰색 오버레이 (밀키 효과)
+          for (int y = top; y < bottom && y < result.height; y++) {
+            for (int x = left; x < right && x < result.width; x++) {
+              final p = result.getPixel(x, y);
+              result.setPixelRgb(
+                x,
+                y,
+                (p.r * 0.55 + 230 * 0.45).round().clamp(0, 255),
+                (p.g * 0.55 + 230 * 0.45).round().clamp(0, 255),
+                (p.b * 0.55 + 230 * 0.45).round().clamp(0, 255),
+              );
+            }
+          }
+          break;
 
-        final resizedSticker = img.copyResize(
-          decodedSticker!,
-          width: finalW,
-          height: finalH,
-        );
+        case BlurEffect.gaussian:
+        case BlurEffect.mosaic:
+        // 기존 코드 유지: 타원형 형태로 가우시안/모자이크 적용
+          final croppedArea = img.copyCrop(
+            result,
+            x: left,
+            y: top,
+            width: cropWidth,
+            height: cropHeight,
+          );
 
-        final dstX = left + (cropWidth - finalW) ~/ 2;
-        final dstY = top + (cropHeight - finalH) ~/ 2;
+          img.Image effectArea;
+          if (effect == BlurEffect.gaussian) {
+            effectArea = img.gaussianBlur(
+              croppedArea,
+              radius: blurIntensity.toInt(),
+            );
+          } else {
+            effectArea = img.pixelate(
+              croppedArea,
+              size: blurIntensity.toInt(),
+              mode: img.PixelateMode.upperLeft,
+            );
+          }
 
-        img.compositeImage(result, resizedSticker, dstX: dstX, dstY: dstY);
-        continue;
-      }
+          final centerX = cropWidth / 2;
+          final centerY = cropHeight / 2;
+          final radiusX = cropWidth / 2;
+          final radiusY = cropHeight / 2;
 
-      img.Image effectArea;
+          for (final p in effectArea) {
+            final dx = p.x - centerX;
+            final dy = p.y - centerY;
+            final insideOval = (dx * dx) / (radiusX * radiusX) +
+                (dy * dy) / (radiusY * radiusY) <=
+                1.0;
 
-      if (effect == BlurEffect.gaussian) {
-        effectArea = img.gaussianBlur(
-          croppedArea,
-          radius: blurIntensity.toInt(),
-        );
-      } else {
-        effectArea = img.pixelate(
-          croppedArea,
-          size: blurIntensity.toInt(),
-          mode: img.PixelateMode.upperLeft,
-        );
-      }
+            if (insideOval) {
+              result.setPixel(left + p.x, top + p.y, p);
+            }
+          }
+          break;
 
-      // 타원형으로 블러 적용
-      final centerX = cropWidth / 2;
-      final centerY = cropHeight / 2;
-      final radiusX = cropWidth / 2;
-      final radiusY = cropHeight / 2;
-
-      for (final p in effectArea) {
-        final dx = p.x - centerX;
-        final dy = p.y - centerY;
-        final insideOval = (dx * dx) / (radiusX * radiusX) +
-            (dy * dy) / (radiusY * radiusY) <=
-            1.0;
-
-        if (insideOval) {
-          result.setPixel(left + p.x, top + p.y, p);
-        }
+        default:
+        // 처리되지 않은 효과는 무시
+          break;
       }
     }
 
